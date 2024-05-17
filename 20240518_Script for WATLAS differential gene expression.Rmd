@@ -1,0 +1,391 @@
+---
+title: "20240518_Script for WATLAS differential gene expression"
+author: "Valdemar B I Johansen"
+date: "2024-05-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(pacman)
+pacman::p_load(tidyverse,
+               readxl,
+               devtools,
+               RColorBrewer,
+               Seurat,
+               viridis,
+               viridisLite,
+               ComplexHeatmap,
+               pheatmap,
+               RGlycopacity,
+               hrbrthemes,
+               sctransform
+               )
+```
+
+## Figure 1
+
+This is an R Markdown document related to main figure 1 and supplementary figure 1 and includes analysis of the WATLAS.
+
+```{r}
+# Importing data 
+watlas <- readRDS("WATLAS_final_metadata.Rds") # This file can be downloaded from the single cell portal maintained by the Broad Institute 
+```
+
+```{r}
+# Cell types from metadata
+cell_types <- unique(watlas@meta.data$group)
+```
+
+```{r}
+# Loading the S1 table from Katrine Schjoldager's review, which describes the glycosyl and sulfotransferase genes of humans. For proteoglycans, one can download the list from Noborn et al 2022 Matrix Biol.
+transferases <- read_excel("41580_2020_294_MOESM2_ESM (1).xlsx",sheet = 1)
+
+# Setting the first row as column names
+colnames(transferases) <- as.character(unlist(transferases[1,]))
+
+# Removing the first row
+transferases <- transferases[-1,]
+
+# defining genes for the pheatmap
+transferase_genes <- transferases$`Gene (HGNC)`
+
+# how many? 
+length(transferase_genes)
+```
+
+```{r}
+# Initializing an empty list to store DE results
+de_results_list0 <- list() 
+
+# Looping through each cell type
+for(cell_type in cell_types) {
+  cat("Processing cell type:", cell_type, "\n")
+  
+  # Subsetting the Seurat object for the cell type
+  sub_watlas <- subset(watlas, subset = group == cell_type)
+  
+  # Further subsetting to only include 'lean' and 'obese', excluding NAs in wtstatus
+  sub_watlas <- subset(sub_watlas, subset = wtstatus %in% c("lean", "obese"))
+  
+  # Setting identities based on wtstatus
+  sub_watlas <- SetIdent(sub_watlas, value = "wtstatus")
+  
+  # Diagnostic: Checking the counts for 'lean' and 'obese' within this subset
+  wtstatus_counts <- table(Idents(sub_watlas))
+  print(wtstatus_counts)
+  
+  # Checking for minimum cell count condition
+  if(all(wtstatus_counts >= 500)) {
+    # Checking if the genes of interest are in the subsetted Seurat object
+    missing_genes <- !transferase_genes %in% rownames(sub_watlas@assays$RNA@counts)
+  
+    # Adjusting the gene list to exclude missing genes
+    available_genes <- transferase_genes[!missing_genes]
+    
+    # Proceeding if there are available genes to analyze
+    if(length(available_genes) > 0) {
+      # Performing differential expression analysis with the adjusted gene list
+      de_results0 <- FindMarkers(sub_watlas, ident.1 = "obese", ident.2 = "lean", features = available_genes, logfc.threshold = 0.5)
+      de_results0$cell_type <- cell_type
+      de_results_list0[[cell_type]] <- de_results0
+    } else {
+      cat("Skipping cell type", cell_type, "- no available genes for analysis.\n")
+    }
+  } else {
+    cat("Skipping cell type", cell_type, "- does not contain more than 500 cells in both 'lean' and 'obese' conditions.\n")
+  }
+}
+
+
+if(length(de_results_list0) < length(cell_types)) {
+  cat("Some cell types were skipped due to not meeting the cell count criterion.\n")
+}
+
+
+# Combining all DE results into a single data frame
+all_de_results0 <- bind_rows(de_results_list0, .id = "cell_type")
+
+# Creating a new 'gene' column by removing the pattern of three dots and the numbers that follow
+all_de_results0$gene <- gsub("\\...\\d+$", "", rownames(all_de_results0))
+
+# THE LOG2FC ARE CALCULATED OBESE/LEAN MEANING THAT POSITIVE VALUES ARE UPREGULATED IN OBESE AND NEGATIVELY VALUES ARE DOWNREGULATED IN OBESE. 
+
+# Looking at results
+all_de_results0%>%
+  filter(p_val_adj<0.05)%>%
+  arrange(avg_log2FC)%>%
+  distinct(gene)
+```
+
+```{r}
+# DE genes to plot
+DE_genes_log2fc_0.5_to_plot <- all_de_results0.5%>%
+  filter(p_val_adj<0.05)%>%
+  select(gene,cell_type,avg_log2FC)
+
+# ggplot2 to create the heatmap with glycopacity 
+heatmap_DEs_log2fc0.5 <- ggplot(DE_genes_log2fc_0.5_to_plot, aes(x = cell_type, y = gene, fill = avg_log2FC)) + 
+  geom_tile() +
+  theme_minimal()+
+  scale_fill_gradient2(low = "yellow", mid = "white", high = "#774299", midpoint = 0, limit = c(min(DE_genes_log2fc_1_to_plot$avg_log2FC), max(DE_genes_log2fc_1_to_plot$avg_log2FC)), space = "Lab", name="avg_log2FC") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title = element_text(size = 0),
+        axis.text.y = element_text(size = 14.5)) +
+  facet_glycogenome(genes=vars(gene),scales="free")
+
+
+ggsave("20240503_Heatmap_KS review S1 table genes_DEs_log2fc_0.5.png", plot = heatmap_DEs_log2fc0.5, width = 8, height = 25, dpi = 600)
+
+writexl::write_xlsx(as.data.frame(all_de_results0),"20240503_WATLAS_glycogenes.xlsx")
+```
+
+Volcanos 
+
+```{r}
+# FAPs 
+
+FAP_0.5FC <- all_de_results0 %>%
+  filter(cell_type == "FAP") %>%
+  mutate(
+    change_direction = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "UP",
+      p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "DOWN",
+      TRUE ~ "FALSE"
+    ),
+    significant_and_large_change = p_val_adj < 0.05 & (avg_log2FC > 0.5 | avg_log2FC < -0.5)
+  ) %>%
+  ggplot(aes(x = avg_log2FC, y = -log10(p_val), color = change_direction)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "#e0e2ed", "UP" = "#8d60a8","DOWN"="#E4D00A")) +
+  theme_classic() +
+  xlim(c(-12,12))+
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey",linewidth=1) +
+  geom_label_repel(
+    aes(label = gene),
+    data = . %>% filter(significant_and_large_change), max.overlaps = 10,label.padding = 0,label.size = 0) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=15),
+        axis.title = element_text(size=0),
+        axis.line = element_line(size = 0.8),
+        axis.ticks = element_line(size=0.8))
+
+ggsave("20240503_FAP_fc0.5.png",plot=FAP_0.5FC, width=5,height=3.5,dpi=600)
+
+#MICs
+
+MIC_0.5FC <- all_de_results0 %>%
+  filter(cell_type == "Myeloid immune cells") %>%
+  mutate(
+    change_direction = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "UP",
+      p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "DOWN",
+      TRUE ~ "FALSE"
+    ),
+    significant_and_large_change = p_val_adj < 0.05 & (avg_log2FC > 0.5 | avg_log2FC < -0.5)
+  ) %>%
+  ggplot(aes(x = avg_log2FC, y = -log10(p_val), color = change_direction)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "#e0e2ed", "UP" = "#8d60a8","DOWN"="#E4D00A")) +
+  theme_classic() +
+  xlim(c(-3,3))+
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey",linewidth=1) +
+  geom_label_repel(
+    aes(label = gene),
+    data = . %>% filter(significant_and_large_change), max.overlaps = 10,label.padding = 0,label.size = 0) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=15),
+        axis.title = element_text(size=0),
+        axis.line = element_line(size = 0.8),
+        axis.ticks = element_line(size=0.8))
+
+ggsave("20240503_MIC_fc0.5.png",plot=MIC_0.5FC, width=5,height=3.5,dpi=600)
+
+#Adipocytes 
+
+Adipo_0.5FC <- all_de_results0 %>%
+  filter(cell_type == "Adipocyte") %>%
+  mutate(
+    change_direction = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "UP",
+      p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "DOWN",
+      TRUE ~ "FALSE"
+    ),
+    significant_and_large_change = p_val_adj < 0.05 & (avg_log2FC > 0.5 | avg_log2FC < -0.5)
+  ) %>%
+  ggplot(aes(x = avg_log2FC, y = -log10(p_val), color = change_direction)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "#e0e2ed", "UP" = "#8d60a8","DOWN"="#E4D00A")) +
+  theme_classic() +
+  xlim(c(-2,2))+
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey",linewidth=1) +
+  geom_label_repel(
+    aes(label = gene),
+    data = . %>% filter(significant_and_large_change), max.overlaps = 10,label.padding = 0,label.size = 0) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=15),
+        axis.title = element_text(size=0),
+        axis.line = element_line(size = 0.8),
+        axis.ticks = element_line(size=0.8))
+
+ggsave("20240503_Adipo_fc0.5.png",plot=Adipo_0.5FC, width=5,height=3.5,dpi=600)
+
+#VECs 
+
+VECs_0.5FC <- all_de_results0 %>%
+  filter(cell_type == "VEC") %>%
+  mutate(
+    change_direction = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "UP",
+      p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "DOWN",
+      TRUE ~ "FALSE"
+    ),
+    significant_and_large_change = p_val_adj < 0.05 & (avg_log2FC > 0.5 | avg_log2FC < -0.5)
+  ) %>%
+  ggplot(aes(x = avg_log2FC, y = -log10(p_val), color = change_direction)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "#e0e2ed", "UP" = "#8d60a8","DOWN"="#E4D00A")) +
+  theme_classic() +
+  xlim(c(-2,2))+
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey",linewidth=1) +
+  geom_label_repel(
+    aes(label = gene),
+    data = . %>% filter(significant_and_large_change), max.overlaps = 10,label.padding = 0,label.size = 0) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=15),
+        axis.title = element_text(size=0),
+        axis.line = element_line(size = 0.8),
+        axis.ticks = element_line(size=0.8))
+
+#LECs 
+
+LECs_0.5FC <- all_de_results0 %>%
+  filter(cell_type == "LEC") %>%
+  mutate(
+    change_direction = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "UP",
+      p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "DOWN",
+      TRUE ~ "FALSE"
+    ),
+    significant_and_large_change = p_val_adj < 0.05 & (avg_log2FC > 0.5 | avg_log2FC < -0.5)
+  ) %>%
+  ggplot(aes(x = avg_log2FC, y = -log10(p_val), color = change_direction)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "#e0e2ed", "UP" = "#8d60a8","DOWN"="#E4D00A")) +
+  theme_classic() +
+  xlim(c(-2,2))+
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey",linewidth=1) +
+  geom_label_repel(
+    aes(label = gene),
+    data = . %>% filter(significant_and_large_change), max.overlaps = 10,label.padding = 0,label.size = 0) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=15),
+        axis.title = element_text(size=0),
+        axis.line = element_line(size = 0.8),
+        axis.ticks = element_line(size=0.8))
+
+ggsave("20240503_LEC_fc0.5.png",plot=LECs_0.5FC, width=5,height=3.5,dpi=600)
+
+#LECs 
+
+LICs_0.5FC <- all_de_results0 %>%
+  filter(cell_type == "Lymphoid immune cells") %>%
+  mutate(
+    change_direction = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "UP",
+      p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "DOWN",
+      TRUE ~ "FALSE"
+    ),
+    significant_and_large_change = p_val_adj < 0.05 & (avg_log2FC > 0.5 | avg_log2FC < -0.5)
+  ) %>%
+  ggplot(aes(x = avg_log2FC, y = -log10(p_val), color = change_direction)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "#e0e2ed", "UP" = "#8d60a8","DOWN"="#E4D00A")) +
+  theme_classic() +
+  xlim(c(-5,5))+
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey",linewidth=1) +
+  geom_label_repel(
+    aes(label = gene),
+    data = . %>% filter(significant_and_large_change), max.overlaps = 10,label.padding = 0,label.size = 0) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=15),
+        axis.title = element_text(size=0),
+        axis.line = element_line(size = 0.8),
+        axis.ticks = element_line(size=0.8))
+
+ggsave("20240503_LIC_fc0.5.png",plot=LICs_0.5FC, width=5,height=3.5,dpi=600)
+
+#Mesothelial
+
+Meso_0.5FC <- all_de_results0 %>%
+  filter(cell_type == "Mesothelial") %>%
+  mutate(
+    change_direction = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "UP",
+      p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "DOWN",
+      TRUE ~ "FALSE"
+    ),
+    significant_and_large_change = p_val_adj < 0.05 & (avg_log2FC > 0.5 | avg_log2FC < -0.5)
+  ) %>%
+  ggplot(aes(x = avg_log2FC, y = -log10(p_val), color = change_direction)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "#e0e2ed", "UP" = "#8d60a8","DOWN"="#E4D00A")) +
+  theme_classic() +
+  xlim(c(-5,5))+
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey",linewidth=1) +
+  geom_label_repel(
+    aes(label = gene),
+    data = . %>% filter(significant_and_large_change), max.overlaps = 10,label.padding = 0,label.size = 0) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=15),
+        axis.title = element_text(size=0),
+        axis.line = element_line(size = 0.8),
+        axis.ticks = element_line(size=0.8))
+
+ggsave("20240503_Mesothelial_fc0.5.png",plot=Meso_0.5FC, width=5,height=3.5,dpi=600)
+
+#Mural
+
+Mural_0.5FC <- all_de_results0 %>%
+  filter(cell_type == "Mural") %>%
+  mutate(
+    change_direction = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "UP",
+      p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "DOWN",
+      TRUE ~ "FALSE"
+    ),
+    significant_and_large_change = p_val_adj < 0.05 & (avg_log2FC > 0.5 | avg_log2FC < -0.5)
+  ) %>%
+  ggplot(aes(x = avg_log2FC, y = -log10(p_val), color = change_direction)) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "#e0e2ed", "UP" = "#8d60a8","DOWN"="#E4D00A")) +
+  theme_classic() +
+  xlim(c(-7,7))+
+  geom_vline(xintercept = 0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_vline(xintercept = -0.5, linetype = "dashed", color = "grey",linewidth=1) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey",linewidth=1) +
+  geom_label_repel(
+    aes(label = gene),
+    data = . %>% filter(significant_and_large_change), max.overlaps = 10,label.padding = 0,label.size = 10) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=15),
+        axis.title = element_text(size=0),
+        axis.line = element_line(size = 0.8),
+        axis.ticks = element_line(size=0.8))
+
+ggsave("20240503_Mural_fc0.5.png",plot=Mural_0.5FC, width=5,height=3.5,dpi=600)
+```
